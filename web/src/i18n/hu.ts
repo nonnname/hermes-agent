@@ -408,6 +408,7 @@ export const hu: Translations = {
       tts: "Szövegfelolvasás",
       stt: "Beszédfelismerés",
       logging: "Naplózás",
+      telegram: "Telegram",
       discord: "Discord",
       auxiliary: "Kiegészítő",
     },

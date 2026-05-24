@@ -409,6 +409,7 @@ export const pt: Translations = {
       tts: "Texto para fala",
       stt: "Fala para texto",
       logging: "Registo",
+      telegram: "Telegram",
       discord: "Discord",
       auxiliary: "Auxiliar",
     },

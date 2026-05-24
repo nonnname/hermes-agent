@@ -754,6 +754,15 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "type": "boolean",
         "description": "Run the local browser in headed mode (visible window). Also keeps the window open between turns; idle sessions are still reaped after browser.inactivity_timeout.",
     },
+    "telegram.smart_mention.system_prompt": {
+        "type": "text",
+        "description": "System prompt for Telegram smart mention classification",
+    },
+    "telegram.smart_mention.on_error": {
+        "type": "select",
+        "description": "Fallback behavior when smart mention classification fails",
+        "options": ["ignore", "process"],
+    },
 }
 
 # Categories with fewer fields get merged into "general" to avoid tab sprawl.
@@ -775,10 +784,6 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # (`onboarding.seen` is an internal latch dict, not a user setting), so fold
     # it into the agent tab rather than spawning a one-field orphan category.
     "onboarding": "agent",
-    # Only `telegram.reactions` currently lives under telegram — fold it in
-    # with the other messaging-platform config (discord) so it isn't an
-    # orphan tab of one field.
-    "telegram": "discord",
     # `mcp.auto_reload_on_config_change` is the only schema-surfaced mcp
     # runtime field (server definitions live under mcp_servers, edited via
     # the MCP tab) — fold it into the agent tab rather than spawning a
@@ -794,7 +799,7 @@ _CATEGORY_MERGE: Dict[str, str] = {
 _CATEGORY_ORDER = [
     "general", "agent", "terminal", "display", "delegation",
     "memory", "compression", "security", "browser", "voice",
-    "tts", "stt", "logging", "discord", "auxiliary",
+    "tts", "stt", "logging", "telegram", "discord", "auxiliary",
 ]
 
 
@@ -6078,6 +6083,7 @@ _AUX_TASK_SLOTS: Tuple[str, ...] = (
     "triage_specifier",
     "kanban_decomposer",
     "profile_describer",
+    "smart_mention",
     "curator",
 )
 
