@@ -100,10 +100,19 @@ If no route matches, the message uses the default/active profile.
    (`gateway_runner`, injected in `gateway/run.py`), so it asks the runner to resolve the
    target profile via `_profile_name_for_source`.
 3. `_profile_name_for_source` runs the configured routes through `match_profile_route` and
-   stamps `source.profile` with the winning route's profile (or leaves it unset).
+   stamps `source.profile` with the winning route's profile. When no shared-credential
+   route matches, a secondary adapter stamps the profile that owns its credential before
+   any pre-dispatch work runs.
 4. Downstream, `_resolve_profile_home_for_source` chooses the profile home directory
    (`source.profile` → active profile → `default`) and the session is scoped per-profile, so
    each routed community gets isolated memory and conversation state.
+
+Pre-dispatch auxiliary work that depends on profile config uses the same source and runtime
+scope. Telegram and Mattermost Smart Mention resolve their platform-specific
+`smart_mention` section, `auxiliary.smart_mention`, and provider credentials from the routed
+profile before deciding whether to dispatch the message to the main agent. Each receiving
+adapter's hard channel/topic allowlists and sender authorization still run before the
+auxiliary model.
 
 Because `gateway_runner` is injected for **all** adapters (declared on `BasePlatformAdapter`),
 every platform goes through this path — not just Discord.

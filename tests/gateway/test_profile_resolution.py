@@ -420,6 +420,34 @@ class TestAdapterToSessionKeyIntegration:
         key = build_session_key(source, profile=source.profile)
         assert key.startswith("agent:main:"), key
 
+    def test_secondary_adapter_ownership_stamps_source_before_handler(self, mock_runner):
+        """Pre-dispatch consumers must see the credential-owning profile.
+
+        Secondary adapters used to receive their profile only in the message
+        handler, which is too late for pre-dispatch Smart Mention classification.
+        """
+        mock_runner.config.profile_routes = []
+        adapter = _stub_adapter(Platform.TELEGRAM, mock_runner)
+        adapter.gateway_profile = "reviewer"
+
+        source = adapter.build_source(
+            chat_id="-1001234567890", chat_type="group", user_id="u1",
+        )
+
+        assert source.profile == "reviewer"
+
+    def test_profile_route_overrides_secondary_adapter_ownership(self, mock_runner):
+        """Preserve the existing first-stamp behavior for shared-bot routes."""
+        mock_runner.config.profile_routes = self._routes()
+        adapter = _stub_adapter(Platform.TELEGRAM, mock_runner)
+        adapter.gateway_profile = "reviewer"
+
+        source = adapter.build_source(
+            chat_id="-1001234567890", chat_type="group", user_id="u1",
+        )
+
+        assert source.profile == "ops"
+
 
 class TestMultiplexGate:
     """``profile_routes`` only activates under ``gateway.multiplex_profiles``.

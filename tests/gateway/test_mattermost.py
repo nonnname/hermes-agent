@@ -1,7 +1,12 @@
 """Tests for Mattermost platform adapter."""
+import asyncio
 import json
 import os
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from types import SimpleNamespace
+
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
@@ -183,18 +188,51 @@ class TestMattermostConfigLoading:
         assert Platform.MATTERMOST in config.platforms
         assert config.platforms[Platform.MATTERMOST].extra.get("url") == ""
 
+    def test_top_level_smart_mention_bridges_to_platform_extra(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from gateway.config import load_gateway_config
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    mattermost:\n"
+            "      enabled: true\n"
+            "      token: test-token\n"
+            "      extra:\n"
+            "        url: https://mm.example.com\n"
+            "mattermost:\n"
+            "  smart_mention:\n"
+            "    enabled: true\n"
+            "    min_confidence: 0.7\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        mattermost = config.platforms[Platform.MATTERMOST]
+        assert mattermost.extra["smart_mention"]["enabled"] is True
+        assert mattermost.extra["smart_mention"]["min_confidence"] == 0.7
+
 
 # ---------------------------------------------------------------------------
 # Adapter format / truncate
 # ---------------------------------------------------------------------------
 
-def _make_adapter():
+def _make_adapter(extra=None):
     """Create a MattermostAdapter with mocked config."""
     from plugins.platforms.mattermost.adapter import MattermostAdapter
+    config_extra = {"url": "https://mm.example.com"}
+    config_extra.update(extra or {})
     config = PlatformConfig(
         enabled=True,
         token="test-token",
-        extra={"url": "https://mm.example.com"},
+        extra=config_extra,
     )
     adapter = MattermostAdapter(config)
     return adapter
@@ -756,6 +794,385 @@ class TestMattermostMentionBehavior:
             msg = self.adapter.handle_message.call_args[0][0]
             assert "@hermes-bot" not in msg.text
             assert "2+2" in msg.text
+
+
+class TestMattermostSmartMention:
+    def setup_method(self):
+        self.adapter = _make_adapter(
+            {
+                "smart_mention": {
+                    "enabled": True,
+                    "min_confidence": 0.6,
+                }
+            }
+        )
+        self.adapter._bot_user_id = "bot_user_id"
+        self.adapter._bot_username = "hermes-bot"
+        self.adapter.handle_message = AsyncMock()
+
+    @staticmethod
+    def _make_event(
+        message,
+        *,
+        post_id="post_smart",
+        channel_id="chan_456",
+        channel_type="O",
+        root_id="",
+        file_ids=None,
+    ):
+        post_data = {
+            "id": post_id,
+            "user_id": "user_123",
+            "channel_id": channel_id,
+            "message": message,
+            "root_id": root_id,
+            "file_ids": file_ids or [],
+        }
+        return {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": channel_type,
+                "sender_name": "@alice",
+            },
+        }
+
+    @staticmethod
+    def _llm_response(*, accepted=True, confidence=0.95):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "should_respond": accepted,
+                                "confidence": confidence,
+                            }
+                        )
+                    )
+                )
+            ]
+        )
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_channel_message_can_be_smart_routed(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("MATTERMOST_REQUIRE_MENTION", raising=False)
+        monkeypatch.delenv("MATTERMOST_FREE_RESPONSE_CHANNELS", raising=False)
+        seen_messages = []
+
+        async def fake_call_llm(**kwargs):
+            seen_messages.extend(kwargs["messages"])
+            return self._llm_response()
+
+        monkeypatch.setattr("agent.auxiliary_client.async_call_llm", fake_call_llm)
+
+        await self.adapter._handle_ws_event(
+            self._make_event("could Hermes investigate the deploy?")
+        )
+
+        self.adapter.handle_message.assert_awaited_once()
+        msg_event = self.adapter.handle_message.call_args.args[0]
+        assert msg_event.text == "could Hermes investigate the deploy?"
+        assert seen_messages[1]["content"].startswith(
+            "Mattermost group routing decision."
+        )
+        assert "bot_username: @hermes-bot" in seen_messages[1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_rejected_candidate_does_not_download_attachments(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("MATTERMOST_REQUIRE_MENTION", raising=False)
+        monkeypatch.delenv("MATTERMOST_FREE_RESPONSE_CHANNELS", raising=False)
+        self.adapter._api_get = AsyncMock()
+
+        async def fake_call_llm(**kwargs):
+            assert "count: 1" in kwargs["messages"][1]["content"]
+            assert "type: attachment" in kwargs["messages"][1]["content"]
+            return self._llm_response(accepted=False, confidence=0.98)
+
+        monkeypatch.setattr("agent.auxiliary_client.async_call_llm", fake_call_llm)
+
+        await self.adapter._handle_ws_event(
+            self._make_event(
+                "latest report attached",
+                file_ids=["file_1"],
+            )
+        )
+
+        self.adapter.handle_message.assert_not_awaited()
+        self.adapter._api_get.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_explicit_mention_bypasses_classifier(self, monkeypatch):
+        monkeypatch.delenv("MATTERMOST_REQUIRE_MENTION", raising=False)
+        call_llm = AsyncMock()
+        monkeypatch.setattr("agent.auxiliary_client.async_call_llm", call_llm)
+
+        await self.adapter._handle_ws_event(
+            self._make_event("@hermes-bot summarize this")
+        )
+
+        call_llm.assert_not_awaited()
+        self.adapter.handle_message.assert_awaited_once()
+        msg_event = self.adapter.handle_message.call_args.args[0]
+        assert msg_event.text == "summarize this"
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_slash_command_does_not_call_classifier(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("MATTERMOST_REQUIRE_MENTION", raising=False)
+        call_llm = AsyncMock()
+        monkeypatch.setattr("agent.auxiliary_client.async_call_llm", call_llm)
+
+        await self.adapter._handle_ws_event(self._make_event(" /new"))
+
+        call_llm.assert_not_awaited()
+        self.adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_candidate_does_not_call_classifier(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("MATTERMOST_REQUIRE_MENTION", raising=False)
+
+        class _Runner:
+            config = SimpleNamespace(multiplex_profiles=False)
+
+            @staticmethod
+            def _is_user_authorized(source):
+                return False
+
+        self.adapter.gateway_runner = _Runner()
+        call_llm = AsyncMock()
+        monkeypatch.setattr("agent.auxiliary_client.async_call_llm", call_llm)
+
+        await self.adapter._handle_ws_event(
+            self._make_event("Hermes should probably inspect this")
+        )
+
+        call_llm.assert_not_awaited()
+        self.adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recent_channel_context_can_be_passed_to_agent(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("MATTERMOST_REQUIRE_MENTION", raising=False)
+        self.adapter.config.extra["channel_prompts"] = {
+            "chan_456": "Base channel prompt."
+        }
+        self.adapter.config.extra["smart_mention"][
+            "pass_recent_context_to_agent"
+        ] = True
+
+        await self.adapter._handle_ws_event(
+            self._make_event(
+                "@hermes-bot deploy failed with exit 2",
+                post_id="post_context_1",
+            )
+        )
+        self.adapter.handle_message.reset_mock()
+
+        async def fake_call_llm(**kwargs):
+            assert "deploy failed with exit 2" in kwargs["messages"][1]["content"]
+            return self._llm_response()
+
+        monkeypatch.setattr("agent.auxiliary_client.async_call_llm", fake_call_llm)
+
+        await self.adapter._handle_ws_event(
+            self._make_event(
+                "could you inspect the traceback?",
+                post_id="post_context_2",
+            )
+        )
+
+        self.adapter.handle_message.assert_awaited_once()
+        msg_event = self.adapter.handle_message.call_args.args[0]
+        assert msg_event.channel_prompt.startswith("Base channel prompt.")
+        assert "Mattermost recent group context" in msg_event.channel_prompt
+        assert "deploy failed with exit 2" in msg_event.channel_prompt
+
+    @pytest.mark.asyncio
+    async def test_concurrent_routed_profiles_keep_classifier_scope_isolated(
+        self,
+        monkeypatch,
+    ):
+        active_profile = ContextVar(
+            "mattermost_smart_mention_profile",
+            default=None,
+        )
+        seen = []
+
+        class _Runner:
+            config = SimpleNamespace(multiplex_profiles=True)
+
+            @contextmanager
+            def _profile_scope_for_source(self, source):
+                token = active_profile.set(source.profile)
+                try:
+                    yield
+                finally:
+                    active_profile.reset(token)
+
+        self.adapter.gateway_runner = _Runner()
+
+        def fake_load_config_readonly():
+            profile = active_profile.get()
+            return {
+                "mattermost": {
+                    "smart_mention": {
+                        "enabled": True,
+                        "system_prompt": f"prompt-{profile}",
+                    }
+                }
+            }
+
+        async def fake_call_llm(**kwargs):
+            before = active_profile.get()
+            await asyncio.sleep(0)
+            after = active_profile.get()
+            seen.append((before, after, kwargs["messages"][0]["content"]))
+            return self._llm_response()
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            fake_load_config_readonly,
+        )
+        monkeypatch.setattr("agent.auxiliary_client.async_call_llm", fake_call_llm)
+
+        async def classify(profile, channel_id):
+            source = SimpleNamespace(
+                profile=profile,
+                chat_id=channel_id,
+            )
+            post = {
+                "id": f"post-{profile}",
+                "user_id": "user_123",
+                "channel_id": channel_id,
+                "message": f"could Hermes handle {profile}?",
+            }
+            with self.adapter._mattermost_smart_mention_profile_context(
+                source
+            ) as config:
+                accepted = await self.adapter._evaluate_mattermost_smart_mention(
+                    source,
+                    post,
+                    config=config,
+                    recent_context=[],
+                )
+                return accepted, config.system_prompt
+
+        results = await asyncio.gather(
+            classify("ops", "ops-channel"),
+            classify("research", "research-channel"),
+        )
+
+        assert results == [
+            (True, "prompt-ops"),
+            (True, "prompt-research"),
+        ]
+        assert sorted(seen) == [
+            ("ops", "ops", "prompt-ops"),
+            ("research", "research", "prompt-research"),
+        ]
+        assert active_profile.get() is None
+
+    @pytest.mark.asyncio
+    async def test_routed_profile_owns_config_auxiliary_scope_and_source(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from agent.secret_scope import get_secret
+        from gateway.config import GatewayConfig
+        from gateway.profile_routing import ProfileRoute
+        from gateway.run import GatewayRunner
+        from hermes_cli.config import load_config_readonly
+        from hermes_constants import get_hermes_home
+
+        root_home = tmp_path / "hermes"
+        profile_home = root_home / "profiles" / "ops"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(root_home))
+        monkeypatch.delenv("MATTERMOST_REQUIRE_MENTION", raising=False)
+
+        (root_home / "config.yaml").write_text(
+            "mattermost:\n"
+            "  smart_mention:\n"
+            "    enabled: false\n"
+            "auxiliary:\n"
+            "  smart_mention:\n"
+            "    model: root-model\n",
+            encoding="utf-8",
+        )
+        (root_home / ".env").write_text(
+            "SMART_MENTION_TEST_TOKEN=root-secret\n",
+            encoding="utf-8",
+        )
+        (profile_home / "config.yaml").write_text(
+            "mattermost:\n"
+            "  smart_mention:\n"
+            "    enabled: true\n"
+            "    system_prompt: ops Mattermost routing prompt\n"
+            "    min_confidence: 0.5\n"
+            "auxiliary:\n"
+            "  smart_mention:\n"
+            "    model: ops-model\n",
+            encoding="utf-8",
+        )
+        (profile_home / ".env").write_text(
+            "SMART_MENTION_TEST_TOKEN=ops-secret\n",
+            encoding="utf-8",
+        )
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_routes=[
+                ProfileRoute(
+                    name="ops-channel",
+                    platform="mattermost",
+                    chat_id="chan_456",
+                    profile="ops",
+                )
+            ],
+        )
+        runner._is_user_authorized = lambda source: source.profile == "ops"
+
+        # Receiving credential config is intentionally disabled. The routed
+        # profile must be the only source of Smart Mention behavior.
+        self.adapter.config.extra["smart_mention"] = {"enabled": False}
+        self.adapter.gateway_runner = runner
+
+        async def fake_call_llm(**kwargs):
+            assert get_hermes_home() == profile_home
+            assert get_secret("SMART_MENTION_TEST_TOKEN") == "ops-secret"
+            config = load_config_readonly()
+            assert config["auxiliary"]["smart_mention"]["model"] == "ops-model"
+            assert kwargs["messages"][0]["content"] == (
+                "ops Mattermost routing prompt"
+            )
+            return self._llm_response()
+
+        monkeypatch.setattr("agent.auxiliary_client.async_call_llm", fake_call_llm)
+
+        await self.adapter._handle_ws_event(
+            self._make_event("could Hermes inspect the incident?")
+        )
+
+        self.adapter.handle_message.assert_awaited_once()
+        msg_event = self.adapter.handle_message.call_args.args[0]
+        assert msg_event.source.profile == "ops"
+        assert get_hermes_home() == root_home
 
 
 # ---------------------------------------------------------------------------

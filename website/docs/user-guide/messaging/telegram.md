@@ -199,6 +199,16 @@ Attachment routing is intentionally lightweight: Hermes does not download, trans
 
 `auxiliary.smart_mention.timeout` is the only timeout for the classifier. If `telegram.smart_mention.system_prompt` is blank, Hermes logs a warning and uses the built-in default prompt.
 
+When `gateway.multiplex_profiles` and `gateway.profile_routes` route a Telegram
+chat to another profile, Smart Mention is resolved inside that profile before
+the main agent runs. Both `telegram.smart_mention` and
+`auxiliary.smart_mention` therefore come from the routed profile, including its
+provider credentials. Configure those two sections explicitly in every routed
+profile where implicit mentions should be enabled; profiles do not inherit the
+default profile's Smart Mention settings. Telegram's hard intake controls
+(`allowed_chats`, allowed/ignored topics, bot-mention exclusivity, and sender
+authorization) still apply at the receiving bot adapter before classification.
+
 ## Step 4: Find Your User ID
 
 Hermes Agent uses numeric Telegram user IDs to control access. Your user ID is **not** your username — it's a number like `123456789`.

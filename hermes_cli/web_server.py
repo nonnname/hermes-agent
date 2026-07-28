@@ -763,6 +763,15 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Fallback behavior when smart mention classification fails",
         "options": ["ignore", "process"],
     },
+    "mattermost.smart_mention.system_prompt": {
+        "type": "text",
+        "description": "System prompt for Mattermost smart mention classification",
+    },
+    "mattermost.smart_mention.on_error": {
+        "type": "select",
+        "description": "Fallback behavior when Mattermost smart mention classification fails",
+        "options": ["ignore", "process"],
+    },
 }
 
 # Categories with fewer fields get merged into "general" to avoid tab sprawl.
@@ -799,7 +808,7 @@ _CATEGORY_MERGE: Dict[str, str] = {
 _CATEGORY_ORDER = [
     "general", "agent", "terminal", "display", "delegation",
     "memory", "compression", "security", "browser", "voice",
-    "tts", "stt", "logging", "telegram", "discord", "auxiliary",
+    "tts", "stt", "logging", "telegram", "mattermost", "discord", "auxiliary",
 ]
 
 

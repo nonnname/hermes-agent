@@ -1,4 +1,5 @@
-from gateway.platforms.telegram_smart_mention import (
+from gateway.platforms.smart_mention import (
+    DEFAULT_MATTERMOST_SMART_MENTION_SYSTEM_PROMPT,
     DEFAULT_SMART_MENTION_SYSTEM_PROMPT,
     SmartMentionConfig,
     build_smart_mention_messages,
@@ -13,6 +14,17 @@ def test_normalize_smart_mention_config_accepts_boolean_shortcut():
 
     assert config.enabled is True
     assert config.system_prompt == DEFAULT_SMART_MENTION_SYSTEM_PROMPT
+
+
+def test_normalize_smart_mention_config_uses_platform_specific_default_prompt():
+    config = normalize_smart_mention_config(
+        {"enabled": True, "system_prompt": ""},
+        default_system_prompt=DEFAULT_MATTERMOST_SMART_MENTION_SYSTEM_PROMPT,
+    )
+
+    assert config.system_prompt == DEFAULT_MATTERMOST_SMART_MENTION_SYSTEM_PROMPT
+    assert "Mattermost" in config.system_prompt
+    assert "Telegram" not in config.system_prompt
 
 
 def test_normalize_smart_mention_config_clamps_numeric_fields_and_trims_prompt():
@@ -112,6 +124,16 @@ def test_build_smart_mention_messages_omits_context_when_disabled():
     assert "previous request" not in messages[1]["content"]
 
 
+def test_build_smart_mention_messages_labels_mattermost_payload():
+    messages = build_smart_mention_messages(
+        config=SmartMentionConfig(),
+        current_text="can Hermes check this?",
+        platform_name="Mattermost",
+    )
+
+    assert messages[1]["content"].startswith("Mattermost group routing decision.")
+
+
 def test_build_smart_mention_messages_truncates_context_without_truncating_current_message():
     current_text = "Hermes, decide whether this production alert needs escalation"
     config = SmartMentionConfig(
@@ -193,3 +215,13 @@ def test_format_recent_context_for_agent_returns_empty_for_blank_context():
     )
 
     assert text == ""
+
+
+def test_format_recent_context_for_agent_labels_mattermost_context():
+    text = format_recent_context_for_agent(
+        [{"sender": "Alice", "text": "deploy failed"}],
+        max_chars=100,
+        platform_name="Mattermost",
+    )
+
+    assert text.startswith("Mattermost recent group context")

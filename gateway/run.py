@@ -1491,7 +1491,7 @@ def _current_max_iterations() -> int:
         return 90
 
 
-from contextlib import contextmanager as _contextmanager
+from contextlib import contextmanager as _contextmanager, nullcontext as _nullcontext
 
 
 # Platforms that bind a host TCP port (HTTP/webhook listeners). In a profile
@@ -9493,6 +9493,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        # Stamp credential ownership before the adapter starts consuming
+        # updates. Some platform-side routing work (notably Smart Mention
+        # classification) happens before the message handler, so the
+        # handler's defensive source.profile stamp is too late for it.
+        adapter.gateway_profile = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -18755,7 +18760,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+        with self._profile_scope_for_source(source):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
@@ -18765,16 +18770,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
             )
 
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-            )
+    def _profile_scope_for_source(self, source: SessionSource):
+        """Return the runtime scope for an inbound source.
+
+        The no-op single-profile branch preserves legacy behavior. Multiplexed
+        pre-dispatch consumers use this same seam as the main agent turn so
+        config and credentials cannot resolve from different profiles.
+        """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return _nullcontext()
+        return _profile_runtime_scope(self._resolve_profile_home_for_source(source))
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.

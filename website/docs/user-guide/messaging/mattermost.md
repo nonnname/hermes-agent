@@ -17,7 +17,7 @@ Before setup, here's the part most people want to know: how Hermes behaves once 
 | Context | Behavior |
 |---------|----------|
 | **DMs** | Hermes responds to every message. No `@mention` needed. Each DM has its own session. |
-| **Public/private channels** | Hermes responds when you `@mention` it. Without a mention, Hermes ignores the message. |
+| **Public/private channels** | Hermes responds when you `@mention` it. With Smart Mention enabled, an auxiliary model can also recognize implicit requests. |
 | **Threads** | If `MATTERMOST_REPLY_MODE=thread`, Hermes replies in a thread under your message. Thread context stays isolated from the parent channel. |
 | **Shared channels with multiple users** | By default, Hermes isolates session history per user inside the channel. Two people talking in the same channel do not share one transcript unless you explicitly disable that. |
 
@@ -224,6 +224,60 @@ By default, the bot only responds in channels when `@mentioned`. You can change 
 To find a channel ID in Mattermost: open the channel, click the channel name header, and look for the ID in the URL or channel details.
 
 When the bot is `@mentioned`, the mention is automatically stripped from the message before processing.
+
+### Smart mention routing for channels
+
+Smart Mention lets Hermes watch ordinary public/private channel messages and
+use a small auxiliary model to decide whether a message is implicitly addressed
+to the bot. Explicit `@botname` mentions and free-response channels keep their
+existing behavior and bypass the classifier.
+
+```yaml
+mattermost:
+  require_mention: true
+  allowed_channels:
+    - "abc123def456ghi789jkl012mno"
+  smart_mention:
+    enabled: true
+    include_recent_context: true
+    recent_context_messages: 5
+    recent_context_max_chars: 2000
+    pass_recent_context_to_agent: false
+    min_confidence: 0.6
+    max_tokens: 128
+    log_decisions: true
+    log_message_text: false
+    on_error: ignore
+    system_prompt: ""  # blank uses Hermes's built-in Mattermost prompt
+
+auxiliary:
+  smart_mention:
+    provider: custom
+    base_url: http://ollama:11434/v1
+    model: qwen2.5:7b-instruct
+    api_key: ollama
+    timeout: 30
+```
+
+The classifier receives the current post plus a volatile in-memory buffer of
+recent messages from the same channel or Mattermost thread. The buffer is not
+persisted and reaches the main agent only when
+`pass_recent_context_to_agent: true`.
+
+Attachment routing stays lightweight: before the decision Hermes sends only
+the post text and attachment count/type metadata to the classifier. It does not
+download files first. An attachment-only post still needs an explicit
+`@botname` mention or a free-response channel.
+
+`auxiliary.smart_mention.timeout` is the classifier timeout. Unauthorized
+senders never reach the auxiliary model, and `allowed_channels` remains a hard
+gate before profile routing or classification.
+
+With `gateway.multiplex_profiles: true`, `gateway.profile_routes` selects the
+profile before Smart Mention runs. Both `mattermost.smart_mention` and
+`auxiliary.smart_mention`, including provider credentials, come from that
+routed profile. Profiles do not inherit these settings, so configure them
+explicitly in each target profile where implicit routing should be enabled.
 
 ## Channel allowlist (`allowed_channels`)
 

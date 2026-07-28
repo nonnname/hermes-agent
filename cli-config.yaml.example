@@ -534,7 +534,7 @@ prompt_caching:
 #     timeout: 30
 #     language: ""           # empty = match the user's language; or e.g. "English"
 #
-#   # Telegram smart mention routing classifier
+#   # Smart mention routing classifier (Telegram and Mattermost)
 #   smart_mention:
 #     provider: "auto"
 #     model: ""
@@ -912,6 +912,25 @@ platform_toolsets:
 #     log_message_text: false
 #     on_error: ignore
 #     system_prompt: ""               # Blank falls back to Hermes's built-in prompt
+#
+# Mattermost-specific settings (canonical top-level config):
+#
+# mattermost:
+#   require_mention: true
+#   free_response_channels: ""        # Channel IDs where no mention is needed
+#   allowed_channels: ""              # Optional channel whitelist
+#   smart_mention:
+#     enabled: false
+#     include_recent_context: true
+#     recent_context_messages: 5
+#     recent_context_max_chars: 2000
+#     pass_recent_context_to_agent: false
+#     min_confidence: 0.6
+#     max_tokens: 128
+#     log_decisions: true
+#     log_message_text: false
+#     on_error: ignore
+#     system_prompt: ""               # Blank falls back to the Mattermost prompt
 #
 # Discord-specific settings (config.yaml top-level, not under platforms:):
 #

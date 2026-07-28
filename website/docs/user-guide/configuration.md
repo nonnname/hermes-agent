@@ -1060,7 +1060,7 @@ auxiliary:
     api_key: ""
     timeout: 30
 
-  # Telegram smart mention classifier
+  # Telegram and Mattermost smart mention classifier
   smart_mention:
     provider: "auto"
     model: ""

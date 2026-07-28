@@ -18,6 +18,8 @@ import json
 import logging
 import os
 import re
+from collections import deque
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,6 +30,14 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+)
+from gateway.platforms.smart_mention import (
+    DEFAULT_MATTERMOST_SMART_MENTION_SYSTEM_PROMPT,
+    SmartMentionConfig,
+    build_smart_mention_messages,
+    format_recent_context_for_agent,
+    normalize_smart_mention_config,
+    parse_smart_mention_response,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,6 +58,7 @@ _CHANNEL_TYPE_MAP = {
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
 _RECONNECT_JITTER = 0.2
+_SMART_MENTION_CONFIG_UNSET = object()
 
 
 def check_mattermost_requirements() -> bool:
@@ -772,6 +783,240 @@ class MattermostAdapter(BasePlatformAdapter):
                 logger.info("Mattermost: WebSocket closed (%s)", raw_msg.type)
                 break
 
+    def _mattermost_smart_mention_config(
+        self,
+        raw: Any = _SMART_MENTION_CONFIG_UNSET,
+        *,
+        profile: Optional[str] = None,
+    ) -> SmartMentionConfig:
+        if raw is _SMART_MENTION_CONFIG_UNSET:
+            raw = self.config.extra.get("smart_mention")
+        config = normalize_smart_mention_config(
+            raw,
+            default_system_prompt=DEFAULT_MATTERMOST_SMART_MENTION_SYSTEM_PROMPT,
+        )
+        if (
+            config.enabled
+            and isinstance(raw, dict)
+            and "system_prompt" in raw
+            and not str(raw.get("system_prompt") or "").strip()
+            and not getattr(self, "_smart_mention_blank_prompt_warned", False)
+        ):
+            logger.warning(
+                "Mattermost: mattermost.smart_mention.system_prompt is blank%s; "
+                "using default prompt",
+                f" for profile {profile!r}" if profile else "",
+            )
+            self._smart_mention_blank_prompt_warned = True
+        return config
+
+    @contextmanager
+    def _mattermost_smart_mention_profile_context(self, source):
+        """Yield Smart Mention config under the inbound source's profile scope."""
+        runner = getattr(self, "gateway_runner", None)
+        multiplex = bool(
+            getattr(getattr(runner, "config", None), "multiplex_profiles", False)
+        )
+        if not multiplex:
+            with nullcontext():
+                yield self._mattermost_smart_mention_config()
+            return
+
+        scope_for_source = getattr(runner, "_profile_scope_for_source", None)
+        if not callable(scope_for_source):
+            logger.warning(
+                "Mattermost: Smart Mention cannot enter routed profile scope; "
+                "disabling classification for this message"
+            )
+            yield self._mattermost_smart_mention_config(None)
+            return
+
+        with scope_for_source(source):
+            try:
+                from hermes_cli.config import load_config_readonly
+
+                runtime_config = load_config_readonly()
+                mattermost_config = (
+                    runtime_config.get("mattermost", {})
+                    if isinstance(runtime_config, dict)
+                    else {}
+                )
+                raw = (
+                    mattermost_config.get("smart_mention")
+                    if isinstance(mattermost_config, dict)
+                    else None
+                )
+                config = self._mattermost_smart_mention_config(
+                    raw,
+                    profile=getattr(source, "profile", None),
+                )
+            except Exception:
+                logger.warning(
+                    "Mattermost: failed to load routed Smart Mention config "
+                    "for profile %r",
+                    getattr(source, "profile", None),
+                    exc_info=True,
+                )
+                config = self._mattermost_smart_mention_config(None)
+            yield config
+
+    @staticmethod
+    def _mattermost_smart_mention_context_key(
+        source,
+        post: Dict[str, Any],
+    ) -> tuple[str, str, str]:
+        # ``root_id`` is empty for channel-level posts and stable for replies.
+        # Do not use the synthesized delivery thread_id here: with
+        # reply_mode=thread each top-level post becomes its own outbound root,
+        # while classifier context should still see recent channel chat.
+        return (
+            str(getattr(source, "profile", None) or ""),
+            str(getattr(source, "chat_id", "") or ""),
+            str(post.get("root_id") or "__channel__"),
+        )
+
+    def _mattermost_smart_mention_recent_context(
+        self,
+        source,
+        post: Dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        key = self._mattermost_smart_mention_context_key(source, post)
+        return list(getattr(self, "_smart_mention_context", {}).get(key, ()))
+
+    def _append_mattermost_smart_mention_context(
+        self,
+        source,
+        post: Dict[str, Any],
+        *,
+        sender_name: str,
+        config: SmartMentionConfig,
+    ) -> None:
+        max_items = max(config.recent_context_messages, 0)
+        text = str(post.get("message") or "").strip()
+        if not config.enabled or max_items <= 0 or not text:
+            return
+
+        key = self._mattermost_smart_mention_context_key(source, post)
+        store = getattr(self, "_smart_mention_context", None)
+        if store is None:
+            self._smart_mention_context = {}
+            store = self._smart_mention_context
+        ring = store.get(key)
+        if ring is None or getattr(ring, "maxlen", None) != max_items:
+            existing = list(ring or [])[-max_items:]
+            ring = deque(existing, maxlen=max_items)
+            store[key] = ring
+        file_ids = post.get("file_ids") or []
+        ring.append(
+            {
+                "sender": sender_name or str(post.get("user_id") or "user"),
+                "text": text,
+                "media": "attachment" if file_ids else "",
+            }
+        )
+
+    def _mattermost_smart_mention_sender_authorized(self, source) -> bool:
+        """Check gateway auth before sending a candidate to an auxiliary LLM."""
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        auth_fn = getattr(runner, "_is_user_authorized", None)
+        if not callable(auth_fn):
+            return True
+        try:
+            return bool(auth_fn(source))
+        except Exception as exc:
+            logger.warning("Mattermost: Smart Mention auth check failed: %s", exc)
+            return False
+
+    async def _evaluate_mattermost_smart_mention(
+        self,
+        source,
+        post: Dict[str, Any],
+        *,
+        config: SmartMentionConfig,
+        recent_context: list[dict[str, Any]],
+    ) -> bool:
+        text = str(post.get("message") or "").strip()
+        if not config.enabled or not text:
+            return False
+
+        from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+
+        file_ids = post.get("file_ids") or []
+        messages = build_smart_mention_messages(
+            config=config,
+            current_text=text,
+            recent_context=recent_context,
+            media_metadata={
+                "type": "attachment",
+                "count": len(file_ids),
+            }
+            if file_ids
+            else None,
+            bot_username=self._bot_username,
+            chat_id=str(getattr(source, "chat_id", "") or ""),
+            thread_id=str(post.get("root_id") or ""),
+            platform_name="Mattermost",
+        )
+        try:
+            response = await async_call_llm(
+                task="smart_mention",
+                messages=messages,
+                temperature=0,
+                max_tokens=config.max_tokens,
+            )
+            raw = extract_content_or_reasoning(response)
+            classification = parse_smart_mention_response(raw)
+            accepted = (
+                classification.should_respond
+                and classification.confidence >= config.min_confidence
+            )
+            if config.log_decisions:
+                if config.log_message_text:
+                    logger.info(
+                        "Mattermost: Smart Mention decision=%s confidence=%.2f "
+                        "reason=%s text=%r",
+                        "process" if accepted else "ignore",
+                        classification.confidence,
+                        classification.reason,
+                        text,
+                    )
+                else:
+                    logger.info(
+                        "Mattermost: Smart Mention decision=%s confidence=%.2f "
+                        "text_len=%d",
+                        "process" if accepted else "ignore",
+                        classification.confidence,
+                        len(text),
+                    )
+            return accepted
+        except Exception as exc:
+            logger.warning("Mattermost: Smart Mention classifier failed: %s", exc)
+            return config.on_error == "process"
+
+    @staticmethod
+    def _apply_mattermost_smart_mention_context_prompt(
+        event: MessageEvent,
+        recent_context: list[dict[str, Any]],
+        *,
+        config: SmartMentionConfig,
+    ) -> MessageEvent:
+        if not config.pass_recent_context_to_agent:
+            return event
+        context_prompt = format_recent_context_for_agent(
+            recent_context,
+            config.recent_context_max_chars,
+            platform_name="Mattermost",
+        )
+        if context_prompt:
+            event.channel_prompt = (
+                f"{event.channel_prompt}\n\n{context_prompt}"
+                if event.channel_prompt
+                else context_prompt
+            )
+        return event
+
     async def _handle_ws_event(self, event: Dict[str, Any]) -> None:
         """Process a single WebSocket event."""
         event_type = event.get("event")
@@ -802,13 +1047,25 @@ class MattermostAdapter(BasePlatformAdapter):
         if self._dedup.is_duplicate(post_id):
             return
 
-        # Build message event.
+        # Resolve stable source fields before mention gating. Smart Mention
+        # needs the same routed profile and thread source as final dispatch.
         channel_id = post.get("channel_id", "")
         channel_type_raw = data.get("channel_type", "O")
         chat_type = _CHANNEL_TYPE_MAP.get(channel_type_raw, "channel")
-
-        # For DMs, user_id is sufficient.  For channels, check for @mention.
         message_text = post.get("message", "")
+        sender_id = post.get("user_id", "")
+        sender_name = data.get("sender_name", "").lstrip("@") or sender_id
+
+        # Thread support: if the post is in a thread, use root_id. In
+        # thread mode, top-level channel posts are valid roots for progress.
+        thread_id = post.get("root_id") or None
+        if (
+            not thread_id
+            and self._reply_mode == "thread"
+            and channel_type_raw != "D"
+            and post_id
+        ):
+            thread_id = post_id
 
         # Mention-gating for non-DM channels.
         # Config (config.yaml `mattermost.*` with env-var fallback):
@@ -835,51 +1092,116 @@ class MattermostAdapter(BasePlatformAdapter):
                 )
                 return
 
-            require_mention = os.getenv(
-                "MATTERMOST_REQUIRE_MENTION", "true"
-            ).lower() not in {"false", "0", "no"}
+            require_mention_raw = os.getenv("MATTERMOST_REQUIRE_MENTION")
+            if require_mention_raw is None:
+                require_mention_raw = (
+                    self.config.extra.get("require_mention", "true")
+                    if self.config.extra
+                    else "true"
+                )
+            require_mention = str(require_mention_raw).lower() not in {
+                "false",
+                "0",
+                "no",
+            }
 
-            free_channels_raw = os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS", "")
-            free_channels = {ch.strip() for ch in free_channels_raw.split(",") if ch.strip()}
+            free_channels_raw = os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS")
+            if free_channels_raw is None:
+                free_channels_raw = (
+                    self.config.extra.get("free_response_channels", "")
+                    if self.config.extra
+                    else ""
+                )
+            if isinstance(free_channels_raw, list):
+                free_channels = {
+                    str(ch).strip()
+                    for ch in free_channels_raw
+                    if str(ch).strip()
+                }
+            else:
+                free_channels = {
+                    ch.strip()
+                    for ch in str(free_channels_raw).split(",")
+                    if ch.strip()
+                }
             is_free_channel = channel_id in free_channels
 
             mention_patterns = [
-                f"@{self._bot_username}",
-                f"@{self._bot_user_id}",
+                f"@{identifier}"
+                for identifier in (self._bot_username, self._bot_user_id)
+                if identifier
             ]
             has_mention = any(
                 pattern.lower() in message_text.lower()
                 for pattern in mention_patterns
             )
 
-            if require_mention and not is_free_channel and not has_mention:
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_type=chat_type,
+            user_id=sender_id,
+            user_name=sender_name,
+            thread_id=thread_id,
+            message_id=post_id,
+        )
+
+        smart_accepted = False
+        smart_recent_context: list[dict[str, Any]] = []
+        smart_config = self._mattermost_smart_mention_config()
+        if channel_type_raw != "D":
+            with self._mattermost_smart_mention_profile_context(source) as smart_config:
+                if has_mention or not require_mention or is_free_channel:
+                    decision = "process"
+                elif (
+                    smart_config.enabled
+                    and bool(str(message_text).strip())
+                    and not str(message_text).lstrip().startswith("/")
+                ):
+                    decision = "smart_mention_candidate"
+                else:
+                    decision = "ignore"
+
+                if decision == "smart_mention_candidate":
+                    if not self._mattermost_smart_mention_sender_authorized(source):
+                        return
+                    smart_recent_context = (
+                        self._mattermost_smart_mention_recent_context(source, post)
+                    )
+                    smart_accepted = await self._evaluate_mattermost_smart_mention(
+                        source,
+                        post,
+                        config=smart_config,
+                        recent_context=smart_recent_context,
+                    )
+
+                if decision in {"process", "smart_mention_candidate"}:
+                    self._append_mattermost_smart_mention_context(
+                        source,
+                        post,
+                        sender_name=sender_name,
+                        config=smart_config,
+                    )
+
+            if decision == "ignore" or (
+                decision == "smart_mention_candidate" and not smart_accepted
+            ):
                 logger.debug(
-                    "Mattermost: skipping non-DM message without @mention (channel=%s)",
+                    "Mattermost: skipping non-DM message without accepted "
+                    "@mention or Smart Mention (channel=%s)",
                     channel_id,
                 )
                 return
 
-            # Strip @mention from the message text so the agent sees clean input.
+            # Strip explicit @mentions only after the routing decision so the
+            # classifier and recent-context buffer see the original message.
             if has_mention:
                 for pattern in mention_patterns:
                     message_text = re.sub(
-                        re.escape(pattern), "", message_text, flags=re.IGNORECASE
+                        re.escape(pattern),
+                        "",
+                        message_text,
+                        flags=re.IGNORECASE,
                     ).strip()
-
-        # Resolve sender info.
-        sender_id = post.get("user_id", "")
-        sender_name = data.get("sender_name", "").lstrip("@") or sender_id
-
-        # Thread support: if the post is in a thread, use root_id. In
-        # thread mode, top-level channel posts are valid roots for progress.
-        thread_id = post.get("root_id") or None
-        if (
-            not thread_id
-            and self._reply_mode == "thread"
-            and channel_type_raw != "D"
-            and post_id
-        ):
-            thread_id = post_id
 
         # Determine message type.
         file_ids = post.get("file_ids") or []
@@ -937,15 +1259,6 @@ class MattermostAdapter(BasePlatformAdapter):
             elif media_types:
                 msg_type = MessageType.DOCUMENT
 
-        source = self.build_source(
-            chat_id=channel_id,
-            chat_type=chat_type,
-            user_id=sender_id,
-            user_name=sender_name,
-            thread_id=thread_id,
-            message_id=post_id,
-        )
-
         # Per-channel ephemeral prompt
         from gateway.platforms.base import resolve_channel_prompt
         _channel_prompt = resolve_channel_prompt(
@@ -958,10 +1271,16 @@ class MattermostAdapter(BasePlatformAdapter):
             source=source,
             raw_message=post,
             message_id=post_id,
-            media_urls=media_urls if media_urls else None,
-            media_types=media_types if media_types else None,
+            media_urls=media_urls,
+            media_types=media_types,
             channel_prompt=_channel_prompt,
         )
+        if smart_accepted:
+            msg_event = self._apply_mattermost_smart_mention_context_prompt(
+                msg_event,
+                smart_recent_context,
+                config=smart_config,
+            )
 
         await self.handle_message(msg_event)
 
@@ -1197,8 +1516,9 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
 
     Env vars take precedence over YAML — every assignment is guarded
     by ``not os.getenv(...)`` so an explicit env var survives a config.yaml
-    update.  Returns ``None`` because no extras are seeded into
-    ``PlatformConfig.extra`` directly (everything flows through env).
+    update. Smart Mention is structured runtime configuration rather than an
+    environment variable, so it is returned for merging into
+    ``PlatformConfig.extra``.
     """
     if "require_mention" in mattermost_cfg and not os.getenv("MATTERMOST_REQUIRE_MENTION"):
         os.environ["MATTERMOST_REQUIRE_MENTION"] = str(mattermost_cfg["require_mention"]).lower()
@@ -1213,7 +1533,10 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
         os.environ["MATTERMOST_ALLOWED_CHANNELS"] = str(ac)
-    return None  # all settings flow through env; nothing to merge into extras
+    extra_updates = {}
+    if "smart_mention" in mattermost_cfg:
+        extra_updates["smart_mention"] = mattermost_cfg["smart_mention"]
+    return extra_updates or None
 
 
 # ---------------------------------------------------------------------------
@@ -1264,7 +1587,8 @@ def register(ctx) -> None:
         # YAML→env config bridge — owns the translation of
         # ``config.yaml`` ``mattermost:`` keys (require_mention,
         # free_response_channels, allowed_channels) into ``MATTERMOST_*``
-        # env vars that the adapter reads via ``os.getenv()``.  Replaces
+        # env vars and returns structured Smart Mention settings for
+        # ``PlatformConfig.extra``. Replaces
         # the hardcoded block that used to live in ``gateway/config.py``.
         # Hook contract: #24836 / #25443.
         apply_yaml_config_fn=_apply_yaml_config,

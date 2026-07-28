@@ -4688,6 +4688,16 @@ class TestBuildSchemaFromConfig:
         assert prompt["category"] == "telegram"
         assert prompt["type"] == "text"
 
+    def test_mattermost_smart_mention_schema_has_own_category_and_text_prompt(self):
+        from hermes_cli.web_server import CONFIG_SCHEMA
+
+        enabled = CONFIG_SCHEMA["mattermost.smart_mention.enabled"]
+        prompt = CONFIG_SCHEMA["mattermost.smart_mention.system_prompt"]
+
+        assert enabled["category"] == "mattermost"
+        assert prompt["category"] == "mattermost"
+        assert prompt["type"] == "text"
+
     def test_no_single_field_categories(self):
         """After merging, no category should have just 1 field."""
         from hermes_cli.web_server import CONFIG_SCHEMA

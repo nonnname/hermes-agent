@@ -3,7 +3,7 @@ import logging
 import asyncio
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -106,6 +106,22 @@ class TestCredentialFingerprint:
 
 
 class TestProfileMessageHandler:
+    def test_configure_profile_adapter_sets_pre_dispatch_ownership(self):
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.session_store = object()
+        runner._busy_text_mode = "interrupt"
+        runner._handle_active_session_busy_message = object()
+        runner._recover_telegram_topic_thread_id = object()
+
+        adapter = Mock()
+        runner._configure_profile_adapter(
+            adapter,
+            "coder",
+            Platform.TELEGRAM,
+        )
+
+        assert adapter.gateway_profile == "coder"
+
     @pytest.mark.asyncio
     async def test_stamps_profile_on_unstamped_source(self):
         runner = GatewayRunner.__new__(GatewayRunner)

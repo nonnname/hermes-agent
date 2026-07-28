@@ -2435,6 +2435,15 @@ class BasePlatformAdapter(ABC):
     # routing is platform-generic instead of Discord-only.
     gateway_runner = None  # type: ignore[assignment]  # set by gateway/run.py
 
+    # Multiplex profile that owns this adapter's credential. Secondary-profile
+    # adapters receive this at configuration time, before they begin consuming
+    # updates. Keeping ownership on the adapter lets pre-dispatch work (for
+    # example Telegram/Mattermost Smart Mention classification) build a fully-routed
+    # SessionSource before the profile message handler runs. A configured
+    # profile_route still wins; this field is the fallback for messages that do
+    # not match a shared-credential route.
+    gateway_profile: Optional[str] = None
+
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
@@ -5698,16 +5707,22 @@ class BasePlatformAdapter(ABC):
         """Helper to build a SessionSource for this platform.
 
         When ``gateway.profile_routes`` is configured, the routing engine
-        resolves the matching profile from guild/chat/thread and stamps it on
-        ``source.profile``. Downstream code (``_resolve_profile_home_for_source``
-        in run.py) reads that field to enter ``_profile_runtime_scope`` for
-        per-profile HERMES_HOME isolation.
+        resolves the matching profile from guild/chat/thread. Otherwise a
+        multiplexed secondary adapter contributes its credential-owning
+        ``gateway_profile``. The selected value is stamped on
+        ``source.profile`` before any pre-dispatch work. Downstream code
+        (``_resolve_profile_home_for_source`` in run.py) reads that field to
+        enter ``_profile_runtime_scope`` for per-profile HERMES_HOME isolation.
         """
         # Normalize empty topic to None
         if chat_topic is not None and not chat_topic.strip():
             chat_topic = None
 
-        # Resolve profile from configured routes (None when no match / no routes)
+        # Resolve profile from configured routes (None when no match / no
+        # routes). When this is a secondary credential adapter, fall back to
+        # the profile that owns the adapter. This must happen while building
+        # the source — pre-dispatch consumers run before the profile message
+        # handler gets a chance to stamp the event.
         profile = None
         runner = getattr(self, "gateway_runner", None)
         if runner is not None:
@@ -5735,6 +5750,8 @@ class BasePlatformAdapter(ABC):
                     "Profile resolution failed for %s/%s, defaulting to active profile",
                     self.platform, chat_id, exc_info=True,
                 )
+        if not profile:
+            profile = getattr(self, "gateway_profile", None) or None
 
         return SessionSource(
             platform=self.platform,

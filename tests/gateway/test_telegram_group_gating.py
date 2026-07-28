@@ -1,11 +1,13 @@
 import asyncio
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 from gateway.platforms.base import MessageType
-from gateway.platforms.telegram_smart_mention import parse_smart_mention_response
+from gateway.platforms.smart_mention import parse_smart_mention_response
 from gateway.session import SessionSource
 
 
@@ -271,6 +273,345 @@ def test_smart_mention_does_not_call_classifier_for_unauthorized_group_user(monk
         await adapter._handle_text_message(update, SimpleNamespace())
 
         call_llm.assert_not_awaited()
+
+    asyncio.run(_run())
+
+
+def test_smart_mention_uses_routed_profile_config_scope_and_source(monkeypatch):
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            # The receiving adapter disables Smart Mention. The routed profile
+            # explicitly enables it and must own the classification decision.
+            smart_mention={"enabled": False},
+        )
+        active_profile = ContextVar("smart_mention_test_profile", default=None)
+        routed_sources = []
+        enqueued = []
+
+        class _Runner:
+            config = SimpleNamespace(multiplex_profiles=True)
+
+            def _profile_name_for_source(self, source):
+                routed_sources.append(source)
+                return "ops"
+
+            @contextmanager
+            def _profile_scope_for_source(self, source):
+                token = active_profile.set(source.profile)
+                try:
+                    yield
+                finally:
+                    active_profile.reset(token)
+
+            def _is_user_authorized(self, source):
+                assert active_profile.get() == "ops"
+                assert source.profile == "ops"
+                return True
+
+        adapter.gateway_runner = _Runner()
+        adapter._ensure_forum_commands = AsyncMock()
+        adapter._cache_replied_media = AsyncMock()
+        adapter._enqueue_text_event = enqueued.append
+
+        def fake_load_config_readonly():
+            profile = active_profile.get()
+            return {
+                "telegram": {
+                    "smart_mention": {
+                        "enabled": True,
+                        "system_prompt": f"{profile} routing prompt",
+                        "min_confidence": 0.5,
+                    }
+                }
+            }
+
+        async def fake_call_llm(**kwargs):
+            assert active_profile.get() == "ops"
+            assert kwargs["messages"][0]["content"] == "ops routing prompt"
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"should_respond": true, "confidence": 0.9}'
+                        )
+                    )
+                ]
+            )
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            fake_load_config_readonly,
+        )
+        monkeypatch.setattr("agent.auxiliary_client.async_call_llm", fake_call_llm)
+
+        update = SimpleNamespace(
+            update_id=1010,
+            message=_group_message("could Hermes investigate this?"),
+            effective_message=None,
+        )
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        assert len(routed_sources) == 1
+        assert len(enqueued) == 1
+        assert enqueued[0].source.profile == "ops"
+        assert active_profile.get() is None
+
+    asyncio.run(_run())
+
+
+def test_routed_profile_can_disable_owner_smart_mention_without_fallback(monkeypatch):
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            smart_mention={"enabled": True},
+        )
+        active_profile = ContextVar(
+            "smart_mention_disabled_profile",
+            default=None,
+        )
+
+        class _Runner:
+            config = SimpleNamespace(multiplex_profiles=True)
+
+            def _profile_name_for_source(self, source):
+                return "quiet"
+
+            @contextmanager
+            def _profile_scope_for_source(self, source):
+                token = active_profile.set(source.profile)
+                try:
+                    yield
+                finally:
+                    active_profile.reset(token)
+
+            def _is_user_authorized(self, source):
+                raise AssertionError("disabled Smart Mention must not reach gateway auth")
+
+        adapter.gateway_runner = _Runner()
+        adapter._enqueue_text_event = Mock()
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {
+                "telegram": {
+                    "smart_mention": {
+                        "enabled": False,
+                    }
+                }
+            },
+        )
+        call_llm = AsyncMock()
+        monkeypatch.setattr("agent.auxiliary_client.async_call_llm", call_llm)
+
+        update = SimpleNamespace(
+            update_id=1011,
+            message=_group_message("Hermes might know what to do"),
+            effective_message=None,
+        )
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        call_llm.assert_not_awaited()
+        adapter._enqueue_text_event.assert_not_called()
+        assert active_profile.get() is None
+
+    asyncio.run(_run())
+
+
+def test_concurrent_smart_mentions_keep_profile_config_and_scope_isolated(monkeypatch):
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            smart_mention={"enabled": False},
+        )
+        active_profile = ContextVar(
+            "concurrent_smart_mention_profile",
+            default=None,
+        )
+        seen = []
+
+        class _Runner:
+            config = SimpleNamespace(multiplex_profiles=True)
+
+            @contextmanager
+            def _profile_scope_for_source(self, source):
+                token = active_profile.set(source.profile)
+                try:
+                    yield
+                finally:
+                    active_profile.reset(token)
+
+        adapter.gateway_runner = _Runner()
+
+        def fake_load_config_readonly():
+            profile = active_profile.get()
+            return {
+                "telegram": {
+                    "smart_mention": {
+                        "enabled": True,
+                        "system_prompt": f"prompt-{profile}",
+                        "min_confidence": 0.5,
+                    }
+                }
+            }
+
+        async def fake_call_llm(**kwargs):
+            before = active_profile.get()
+            await asyncio.sleep(0)
+            after = active_profile.get()
+            seen.append((before, after, kwargs["messages"][0]["content"]))
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"should_respond": true, "confidence": 1.0}'
+                        )
+                    )
+                ]
+            )
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            fake_load_config_readonly,
+        )
+        monkeypatch.setattr("agent.auxiliary_client.async_call_llm", fake_call_llm)
+
+        async def classify(profile, chat_id):
+            source = SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id=str(chat_id),
+                chat_type="group",
+                user_id="111",
+                profile=profile,
+            )
+            message = _group_message(
+                f"can Hermes handle {profile}?",
+                chat_id=chat_id,
+            )
+            with adapter._telegram_smart_mention_profile_context(source) as config:
+                accepted = await adapter._evaluate_telegram_smart_mention(
+                    message,
+                    config=config,
+                )
+                return accepted, config.system_prompt
+
+        results = await asyncio.gather(
+            classify("ops", -100),
+            classify("research", -200),
+        )
+
+        assert results == [
+            (True, "prompt-ops"),
+            (True, "prompt-research"),
+        ]
+        assert sorted(seen) == [
+            ("ops", "ops", "prompt-ops"),
+            ("research", "research", "prompt-research"),
+        ]
+        assert active_profile.get() is None
+
+    asyncio.run(_run())
+
+
+def test_smart_mention_profile_route_uses_real_profile_config_and_secret_scope(
+    monkeypatch,
+    tmp_path,
+):
+    async def _run():
+        from agent.secret_scope import get_secret
+        from gateway.config import GatewayConfig
+        from gateway.profile_routing import ProfileRoute
+        from gateway.run import GatewayRunner
+        from hermes_cli.config import load_config_readonly
+        from hermes_constants import get_hermes_home
+
+        root_home = tmp_path / "hermes"
+        profile_home = root_home / "profiles" / "ops"
+        profile_home.mkdir(parents=True)
+        root_home.mkdir(exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(root_home))
+
+        (root_home / "config.yaml").write_text(
+            "telegram:\n"
+            "  smart_mention:\n"
+            "    enabled: false\n"
+            "auxiliary:\n"
+            "  smart_mention:\n"
+            "    model: root-model\n",
+            encoding="utf-8",
+        )
+        (root_home / ".env").write_text(
+            "SMART_MENTION_TEST_TOKEN=root-secret\n",
+            encoding="utf-8",
+        )
+        (profile_home / "config.yaml").write_text(
+            "telegram:\n"
+            "  smart_mention:\n"
+            "    enabled: true\n"
+            "    system_prompt: ops profile prompt\n"
+            "    min_confidence: 0.5\n"
+            "auxiliary:\n"
+            "  smart_mention:\n"
+            "    model: ops-model\n",
+            encoding="utf-8",
+        )
+        (profile_home / ".env").write_text(
+            "SMART_MENTION_TEST_TOKEN=ops-secret\n",
+            encoding="utf-8",
+        )
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_routes=[
+                ProfileRoute(
+                    name="ops-chat",
+                    platform="telegram",
+                    chat_id="-100",
+                    profile="ops",
+                )
+            ],
+        )
+        runner._is_user_authorized = lambda source: source.profile == "ops"
+
+        adapter = _make_adapter(
+            require_mention=True,
+            smart_mention={"enabled": False},
+        )
+        adapter.gateway_runner = runner
+        adapter._ensure_forum_commands = AsyncMock()
+        adapter._cache_replied_media = AsyncMock()
+        enqueued = []
+        adapter._enqueue_text_event = enqueued.append
+
+        async def fake_call_llm(**kwargs):
+            assert get_hermes_home() == profile_home
+            assert get_secret("SMART_MENTION_TEST_TOKEN") == "ops-secret"
+            config = load_config_readonly()
+            assert config["auxiliary"]["smart_mention"]["model"] == "ops-model"
+            assert kwargs["messages"][0]["content"] == "ops profile prompt"
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"should_respond": true, "confidence": 0.95}'
+                        )
+                    )
+                ]
+            )
+
+        monkeypatch.setattr("agent.auxiliary_client.async_call_llm", fake_call_llm)
+
+        update = SimpleNamespace(
+            update_id=1012,
+            message=_group_message("could Hermes inspect the incident?"),
+            effective_message=None,
+        )
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        assert len(enqueued) == 1
+        assert enqueued[0].source.profile == "ops"
+        assert get_hermes_home() == root_home
 
     asyncio.run(_run())
 

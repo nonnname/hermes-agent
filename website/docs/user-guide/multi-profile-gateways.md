@@ -241,6 +241,14 @@ multiplexing off the routes are ignored. If a route names a profile that does
 not exist on disk, the gateway logs a warning naming the profile and source and
 falls back to the default home.
 
+Pre-dispatch auxiliary routing follows the same profile decision. Telegram and
+Mattermost Smart Mention load the relevant platform `smart_mention` section
+plus `auxiliary.smart_mention` from the routed profile and run the classifier
+with that profile's credential scope. The receiving adapter's hard allowlists,
+topic gates, and sender authorization remain in force. Because profiles are
+independent, enable and configure Smart Mention explicitly in each target
+profile that should classify implicit group/channel mentions.
+
 ## Start, stop, or restart all gateways at once
 
 The CLI ships with single-profile lifecycle commands. To act across every

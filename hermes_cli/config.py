@@ -48,6 +48,13 @@ Return false for ordinary human-to-human conversation, status chatter, jokes, me
 
 Do not answer the user. Only classify routing."""
 
+DEFAULT_MATTERMOST_SMART_MENTION_SYSTEM_PROMPT = (
+    DEFAULT_TELEGRAM_SMART_MENTION_SYSTEM_PROMPT.replace(
+        "Telegram",
+        "Mattermost",
+    )
+)
+
 # Track which (config_path, mtime_ns, size) tuples we've already warned about
 # so concurrent CLI/gateway loads of a broken config.yaml don't spam stderr
 # every time. Cleared automatically when the file changes (different mtime).
@@ -2695,6 +2702,19 @@ DEFAULT_CONFIG = {
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "channel_prompts": {},         # Per-channel ephemeral system prompts
+        "smart_mention": {
+            "enabled": False,
+            "system_prompt": DEFAULT_MATTERMOST_SMART_MENTION_SYSTEM_PROMPT,
+            "include_recent_context": True,
+            "recent_context_messages": 5,
+            "recent_context_max_chars": 2000,
+            "pass_recent_context_to_agent": False,
+            "min_confidence": 0.6,
+            "max_tokens": 128,
+            "log_decisions": True,
+            "log_message_text": False,
+            "on_error": "ignore",
+        },
     },
 
     # Matrix platform settings (gateway mode)
